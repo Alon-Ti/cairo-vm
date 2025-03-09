@@ -14,6 +14,8 @@
 
 * feat: Add `ProverInfo` and extract the relevant information for it from the runner [#2001](https://github.com/lambdaclass/cairo-vm/pull/2001)
 
+* feat: Support hints for new blake felt serialization library code [#1994](https://github.com/lambdaclass/cairo-vm/pull/1994)
+
 #### [2.0.1] - 2025-03-17
 
 * feat: Limited padding of builtin segments to >=16 [#1981](https://github.com/lambdaclass/cairo-vm/pull/1981)

@@ -1,7 +1,7 @@
 #[cfg(feature = "cairo-0-secp-hints")]
 use super::secp::cairo0_hints;
 use super::{
-    blake2s_utils::finalize_blake2s_v3,
+    blake2s_utils::{blake2s_unpack_felts, finalize_blake2s_v3, is_more_than_63_bits_and_not_end},
     ec_recover::{
         ec_recover_divmod_n_packed, ec_recover_product_div_m, ec_recover_product_mod,
         ec_recover_sub_a_b,
@@ -359,6 +359,12 @@ impl HintProcessorLogic for BuiltinHintProcessor {
             }
             hint_code::BLAKE2S_ADD_UINT256_BIGEND => {
                 blake2s_add_uint256_bigend(vm, &hint_data.ids_data, &hint_data.ap_tracking)
+            }
+            hint_code::IS_MORE_THAN_63_BITS_AND_NOT_END => {
+                is_more_than_63_bits_and_not_end(vm, &hint_data.ids_data, &hint_data.ap_tracking)
+            }
+            hint_code::BLAKE2S_UNPACK_FELTS => {
+                blake2s_unpack_felts(vm, &hint_data.ids_data, &hint_data.ap_tracking)
             }
             hint_code::UNSAFE_KECCAK => {
                 unsafe_keccak(vm, exec_scopes, &hint_data.ids_data, &hint_data.ap_tracking)

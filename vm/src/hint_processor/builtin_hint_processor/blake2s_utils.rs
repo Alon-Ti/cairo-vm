@@ -1,3 +1,4 @@
+use crate::hint_processor::hint_processor_utils::felt_to_usize;
 use crate::stdlib::{borrow::Cow, collections::HashMap, prelude::*};
 
 use crate::types::errors::math_errors::MathError;
@@ -17,9 +18,11 @@ use crate::{
     vm::{errors::hint_errors::HintError, vm_core::VirtualMachine},
 };
 
+use num_bigint::BigUint;
+use num_integer::Integer;
 use num_traits::ToPrimitive;
 
-use super::hint_utils::get_integer_from_var_name;
+use super::hint_utils::{get_integer_from_var_name, insert_value_into_ap};
 
 fn get_fixed_size_u32_array<const T: usize>(
     h_range: &Vec<Cow<Felt252>>,
@@ -239,6 +242,84 @@ pub fn blake2s_add_uint256_bigend(
     data.reverse();
     //Insert second batch of data
     vm.load_data(data_ptr, &data).map_err(HintError::Memory)?;
+    Ok(())
+}
+
+/* Implements Hint:
+memory[ap] = (ids.end != ids.packed_values) and (memory[ids.packed_values] < 2**63)
+*/
+pub fn is_more_than_63_bits_and_not_end(
+    vm: &mut VirtualMachine,
+    ids_data: &HashMap<String, HintReference>,
+    ap_tracking: &ApTracking,
+) -> Result<(), HintError> {
+    let end = get_ptr_from_var_name("end", vm, ids_data, ap_tracking)?;
+    let packed_values = get_ptr_from_var_name("packed_values", vm, ids_data, ap_tracking)?;
+
+    if end == packed_values {
+        insert_value_into_ap(vm, 0)?
+    } else {
+        let val = vm.get_integer(packed_values)?;
+        insert_value_into_ap(
+            vm,
+            (val.to_biguint() < (BigUint::from(1_u32) << 63)) as usize,
+        )?
+    }
+    Ok(())
+}
+
+/* Implements Hint:
+offset = 0
+for i in range(ids.packed_values_len):
+    val = (memory[ids.packed_values + i] % PRIME)
+    val_len = 2 if val < 2**63 else 8
+    if val_len == 8:
+        val += 2**255
+    for i in range(val_len - 1, -1, -1):
+        val, memory[ids.unpacked_u32s + offset + i] = divmod(val, 2**32)
+    assert val == 0
+    offset += val_len
+*/
+pub fn blake2s_unpack_felts(
+    vm: &mut VirtualMachine,
+    ids_data: &HashMap<String, HintReference>,
+    ap_tracking: &ApTracking,
+) -> Result<(), HintError> {
+    let packed_values_len =
+        get_integer_from_var_name("packed_values_len", vm, ids_data, ap_tracking)?;
+    let packed_values = get_ptr_from_var_name("packed_values", vm, ids_data, ap_tracking)?;
+    let unpacked_u32s = get_ptr_from_var_name("unpacked_u32s", vm, ids_data, ap_tracking)?;
+
+    let vals = vm.get_integer_range(packed_values, felt_to_usize(&packed_values_len)?)?;
+    let pow2_32 = BigUint::from(1_u32) << 32;
+    let pow2_63 = BigUint::from(1_u32) << 63;
+    let pow2_255 = BigUint::from(1_u32) << 255;
+
+    // Split value into either 2 or 8 32-bit limbs.
+    let out: Vec<MaybeRelocatable> = vals
+        .into_iter()
+        .map(|val| val.to_biguint())
+        .flat_map(|val| {
+            if val < pow2_63 {
+                let (high, low) = val.div_rem(&pow2_32);
+                vec![high, low]
+            } else {
+                let mut limbs = vec![BigUint::from(0_u32); 8];
+                let mut val: BigUint = val + &pow2_255;
+                for limb in limbs.iter_mut().rev() {
+                    let (q, r) = val.div_rem(&pow2_32);
+                    *limb = r;
+                    val = q;
+                }
+                limbs
+            }
+        })
+        .map(Felt252::from)
+        .map(MaybeRelocatable::from)
+        .collect();
+
+    vm.load_data(unpacked_u32s, &out)
+        .map_err(HintError::Memory)?;
     Ok(())
 }
 
@@ -602,6 +683,103 @@ mod tests {
             .memory
             .get(&MaybeRelocatable::from((2, 8)))
             .is_none());
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn is_less_than_63_bits_and_not_end_ends() {
+        let hint_code = hint_code::IS_MORE_THAN_63_BITS_AND_NOT_END;
+        //Create vm
+        let mut vm = vm!();
+        //Insert ids into memory
+        vm.segments = segments![((1, 0), (1, 2)), ((1, 1), (1, 2)), ((1, 2), 123)];
+        vm.set_fp(3);
+        vm.set_ap(3);
+        let ids_data = ids_data!["end", "packed_values", "value"];
+        //Execute the hint
+        assert_matches!(run_hint!(vm, ids_data, hint_code), Ok(()));
+        //Check data ptr
+        check_memory![vm.segments.memory, ((1, 3), 0)];
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn is_less_than_63_bits_and_not_end_small() {
+        let hint_code = hint_code::IS_MORE_THAN_63_BITS_AND_NOT_END;
+        //Create vm
+        let mut vm = vm!();
+        //Insert ids into memory
+        vm.segments = segments![((1, 0), (1, 3)), ((1, 1), (1, 2)), ((1, 2), 123)];
+        vm.set_fp(3);
+        vm.set_ap(3);
+        let ids_data = ids_data!["end", "packed_values", "value"];
+        //Execute the hint
+        assert_matches!(run_hint!(vm, ids_data, hint_code), Ok(()));
+        //Check data ptr
+        check_memory![vm.segments.memory, ((1, 3), 1)];
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn is_less_than_63_bits_and_not_end_big() {
+        let hint_code = hint_code::IS_MORE_THAN_63_BITS_AND_NOT_END;
+        //Create vm
+        let mut vm = vm!();
+        //Insert ids into memory
+        vm.segments = segments![
+            ((1, 0), (1, 3)),
+            ((1, 1), (1, 2)),
+            ((1, 2), 0x10000000000000000)
+        ];
+        vm.set_fp(3);
+        vm.set_ap(3);
+        let ids_data = ids_data!["end", "packed_values", "value"];
+        //Execute the hint
+        assert_matches!(run_hint!(vm, ids_data, hint_code), Ok(()));
+        //Check data ptr
+        check_memory![vm.segments.memory, ((1, 3), 0)];
+    }
+
+    #[test]
+    #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
+    fn blake2s_unpack_felts() {
+        let hint_code = hint_code::BLAKE2S_UNPACK_FELTS;
+        //Create vm
+        let mut vm = vm!();
+        //Insert ids into memory
+        vm.segments = segments![
+            ((1, 0), 2),
+            ((1, 1), (1, 3)),
+            ((1, 2), (2, 0)),
+            ((1, 3), 0x123456781234),
+            ((1, 4), 0x1234abcd5678efab1234abcd)
+        ];
+        vm.set_fp(5);
+        vm.set_ap(5);
+        let ids_data = ids_data![
+            "packed_values_len",
+            "packed_values",
+            "unpacked_u32s",
+            "small_value",
+            "big_value"
+        ];
+        vm.segments.add();
+        //Execute the hint
+        assert_matches!(run_hint!(vm, ids_data, hint_code), Ok(()));
+        //Check data ptr
+        check_memory![
+            vm.segments.memory,
+            ((2, 0), 0x1234),
+            ((2, 1), 0x56781234),
+            ((2, 2), 0x80000000),
+            ((2, 3), 0),
+            ((2, 4), 0),
+            ((2, 5), 0),
+            ((2, 6), 0),
+            ((2, 7), 0x1234abcd),
+            ((2, 8), 0x5678efab),
+            ((2, 9), 0x1234abcd)
+        ];
     }
 
     #[test]
