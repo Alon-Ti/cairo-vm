@@ -42,6 +42,7 @@ use num_traits::{ToPrimitive, Zero};
 use super::errors::runner_errors::RunnerError;
 use super::runners::builtin_runner::{ModBuiltinRunner, RC_N_PARTS_STANDARD};
 use super::runners::cairo_pie::CairoPie;
+use super::vm_memory::memory::MemoryCell;
 
 const MAX_TRACEBACK_ENTRIES: u32 = 20;
 
@@ -774,6 +775,48 @@ impl VirtualMachine {
         Ok(())
     }
 
+    /// Forces the completion of all auto deductions.
+    pub fn complete_builtin_auto_deductions(&mut self) -> Result<(), VirtualMachineError> {
+        for builtin in self.builtin_runners.iter() {
+            let index: usize = builtin.base();
+            let builtin_segment = &mut self.segments.memory.data[index];
+
+            // Extend the segment to a multiple of the number of cells per instance
+            let len = builtin_segment.len();
+            let cells = builtin.cells_per_instance() as usize;
+            let remainder = cells - 1 - (cells + len - 1) % cells;
+            builtin_segment.extend(vec![MemoryCell::NONE; remainder].iter());
+
+            let mut new_values: Vec<(usize, MemoryCell)> = vec![];
+
+            for (offset, cell) in self.segments.memory.data[index].iter().enumerate() {
+                if let Some(deduced_memory_cell) = builtin
+                    .deduce_memory_cell(
+                        Relocatable::from((index as isize, offset)),
+                        &self.segments.memory,
+                    )
+                    .map_err(VirtualMachineError::RunnerError)?
+                {
+                    let value = cell.get_value();
+                    if value.is_some() {
+                        if Some(&deduced_memory_cell) != value.as_ref() {
+                            return Err(VirtualMachineError::InconsistentAutoDeduction(Box::new(
+                                (builtin.name(), deduced_memory_cell, value),
+                            )));
+                        }
+                    } else {
+                        new_values.push((offset, MemoryCell::new(deduced_memory_cell)));
+                    }
+                }
+            }
+
+            for (offset, value) in new_values {
+                self.segments.memory.data[index][offset] = value;
+            }
+        }
+        Ok(())
+    }
+
     //Makes sure that the value at the given address is consistent with the auto deduction rules.
     pub fn verify_auto_deductions_for_addr(
         &self,
@@ -799,7 +842,7 @@ impl VirtualMachine {
     }
 
     pub fn end_run(&mut self, exec_scopes: &ExecutionScopes) -> Result<(), VirtualMachineError> {
-        self.verify_auto_deductions()?;
+        self.complete_builtin_auto_deductions()?;
         self.run_finished = true;
         match exec_scopes.data.len() {
             1 => Ok(()),

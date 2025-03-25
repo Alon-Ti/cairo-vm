@@ -401,7 +401,7 @@ impl BuiltinRunner {
         }
     }
 
-    fn cells_per_instance(&self) -> u32 {
+    pub fn cells_per_instance(&self) -> u32 {
         match self {
             BuiltinRunner::Bitwise(_) => CELLS_PER_BITWISE,
             BuiltinRunner::EcOp(_) => CELLS_PER_EC_OP,
